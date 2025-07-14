@@ -3,32 +3,32 @@
 #![feature(rustc_private)]
 
 // extern crate do_not_use_safe_print;
+extern crate rustc_abi;
 extern crate rustc_ast;
 extern crate rustc_codegen_ssa;
 extern crate rustc_data_structures;
 extern crate rustc_driver;
 extern crate rustc_error_codes;
 extern crate rustc_errors;
+extern crate rustc_expand;
 extern crate rustc_feature;
+extern crate rustc_fluent_macro;
 extern crate rustc_hash;
 extern crate rustc_hir;
 extern crate rustc_index;
 extern crate rustc_interface;
 extern crate rustc_lint;
+extern crate rustc_macros;
 extern crate rustc_metadata;
 extern crate rustc_middle;
 extern crate rustc_mir_transform;
 extern crate rustc_parse;
+extern crate rustc_resolve;
 extern crate rustc_session;
 extern crate rustc_span;
 extern crate rustc_target;
 extern crate serde_json;
 extern crate tracing;
-extern crate rustc_expand;
-extern crate rustc_resolve;
-extern crate rustc_abi;
-extern crate rustc_fluent_macro;
-extern crate rustc_macros;
 
 // use rustc_fluent_macro::fluent_generated;
 
@@ -86,8 +86,8 @@ use rustc_target::json::ToJson;
 use rustc_target::spec::{Target, TargetTuple};
 use tracing::trace;
 
+/* This module cannot be included because of missing dependencies */
 // mod session_diagnostics;
-
 // use crate::session_diagnostics::{
 //     CantEmitMIR, RLinkEmptyVersionNumber, RLinkEncodingVersionMismatch, RLinkRustcVersionMismatch,
 //     RLinkWrongFileType, RlinkCorruptFile, RlinkNotAFile, RlinkUnableToRead, UnstableFeatureUsage,
@@ -99,6 +99,212 @@ fn main() {
     run_compiler(&args);
 }
 
+fn run_compiler(at_args: &[String]) {
+    let mut default_early_dcx =
+        rustc_session::EarlyDiagCtxt::new(rustc_session::config::ErrorOutputType::default());
+
+    let at_args = at_args.get(1..).unwrap_or_default();
+
+    let args = rustc_driver::args::arg_expand_all(&default_early_dcx, at_args);
+
+    let Some(matches) = rustc_driver::handle_options(&default_early_dcx, &args) else {
+        return;
+    };
+
+    let sopts = rustc_session::config::build_session_options(&mut default_early_dcx, &matches);
+
+    /* No ice file */
+    // let ice_file = ice_path_with_config(Some(&sopts.unstable_opts)).clone();
+
+    /* Not sure what this does */
+    // if let Some(ref code) = matches.opt_str("explain") {
+    //     handle_explain(&default_early_dcx, diagnostics_registry(), code, sopts.color);
+    //     return;
+    // }
+
+    let input = make_input(&default_early_dcx, &matches.free);
+    let has_input = input.is_some();
+    let (odir, ofile) = make_output(&matches);
+
+    drop(default_early_dcx);
+
+    let mut config = rustc_interface::Config {
+        opts: sopts,
+        crate_cfg: matches.opt_strs("cfg"),
+        crate_check_cfg: matches.opt_strs("check-cfg"),
+        input: input.unwrap_or(rustc_session::config::Input::File(std::path::PathBuf::new())),
+        output_file: ofile,
+        output_dir: odir,
+        file_loader: None,
+        locale_resources: rustc_driver::DEFAULT_LOCALE_RESOURCES.to_owned(),
+        lint_caps: Default::default(),
+        psess_created: None,
+        hash_untracked_state: None,
+        register_lints: None,
+        override_queries: None,
+        extra_symbols: Vec::new(),
+        make_codegen_backend: None,
+        ice_file: None,
+        registry: diagnostics_registry(),
+        using_internal_features: &rustc_driver::USING_INTERNAL_FEATURES,
+        expanded_args: args,
+    };
+
+    /* No callbacks supported yet, unlikely the average crate uses callbacks */
+    // callbacks.config(&mut config);
+
+    let registered_lints = config.register_lints.is_some();
+
+    rustc_interface::run_compiler(config, |compiler| {
+        let sess = &compiler.sess;
+        let codegen_backend = &*compiler.codegen_backend;
+
+        // This is used for early exits unrelated to errors. E.g. when just
+        // printing some information without compiling, or exiting immediately
+        // after parsing, etc.
+        let early_exit = || {
+            sess.dcx().abort_if_errors();
+        };
+
+        // This implements `-Whelp`. It should be handled very early, like
+        // `--help`/`-Zhelp`/`-Chelp`. This is the earliest it can run, because
+        // it must happen after lints are registered, during session creation.
+        if sess.opts.describe_lints {
+            describe_lints(sess, registered_lints);
+            return early_exit();
+        }
+
+        /* needed to compile basic crates because cargo requests version and other information from rustc */
+        if print_crate_info(codegen_backend, sess, has_input) == rustc_driver::Compilation::Stop {
+            return early_exit();
+        }
+
+        if !has_input {
+            #[allow(rustc::diagnostic_outside_of_impl)]
+            sess.dcx().fatal("no input filename given"); // this is fatal
+        }
+
+        if !sess.opts.unstable_opts.ls.is_empty() {
+            list_metadata(sess, &*codegen_backend.metadata_loader());
+            return early_exit();
+        }
+
+        /* what is process_rlink? blocked because can't find something needed for #![derive(Diagnostics)] in session_diagnostics.rs */
+        if sess.opts.unstable_opts.link_only {
+            // process_rlink(sess, compiler);
+            return early_exit();
+        }
+
+        // Parse the crate root source code (doesn't parse submodules yet)
+        // Everything else is parsed during macro expansion.
+        let mut krate = rustc_interface::passes::parse(sess);
+
+        /* Do some manipulations? Need to verify what krate could be missing, e.g., other files/modules */
+
+        // If pretty printing is requested: Figure out the representation, print it and exit
+        if let Some(pp_mode) = sess.opts.pretty {
+            if pp_mode.needs_ast_map() {
+                rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
+                    tcx.ensure_ok().early_lint_checks(());
+                    rustc_driver::pretty::print(
+                        sess,
+                        pp_mode,
+                        rustc_driver::pretty::PrintExtra::NeedsAstMap { tcx },
+                    );
+                    rustc_interface::passes::write_dep_info(tcx);
+                });
+            } else {
+                rustc_driver::pretty::print(
+                    sess,
+                    pp_mode,
+                    rustc_driver::pretty::PrintExtra::AfterParsing { krate: &krate },
+                );
+            }
+            // trace!("finished pretty-printing");
+            return early_exit();
+        }
+
+        /* No callbacks */
+        // if callbacks.after_crate_root_parsing(compiler, &mut krate) == Compilation::Stop {
+        //     return early_exit();
+        // }
+
+        if sess.opts.unstable_opts.parse_crate_root_only {
+            return early_exit();
+        }
+
+        let linker = rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
+            let early_exit = || {
+                sess.dcx().abort_if_errors();
+                None
+            };
+
+            // Make sure name resolution and macro expansion is run.
+            let _ = tcx.resolver_for_lowering();
+
+            /* No callbacks */
+            // if callbacks.after_expansion(compiler, tcx) == Compilation::Stop {
+            //     return early_exit();
+            // }
+
+            rustc_interface::passes::write_dep_info(tcx);
+
+            rustc_interface::passes::write_interface(tcx);
+
+            if sess
+                .opts
+                .output_types
+                .contains_key(&rustc_session::config::OutputType::DepInfo)
+                && sess.opts.output_types.len() == 1
+            {
+                return early_exit();
+            }
+
+            if sess.opts.unstable_opts.no_analysis {
+                return early_exit();
+            }
+
+            tcx.ensure_ok().analysis(());
+
+            /* No metrics */
+            // if let Some(metrics_dir) = &sess.opts.unstable_opts.metrics_dir {
+            //     dump_feature_usage_metrics(tcx, metrics_dir);
+            // }
+
+            /* No callbacks */
+            // if callbacks.after_analysis(compiler, tcx) == Compilation::Stop {
+            //     return early_exit();
+            // }
+
+            /* No diagnostics */
+            // if tcx
+            //     .sess
+            //     .opts
+            //     .output_types
+            //     .contains_key(&rustc_session::config::OutputType::Mir)
+            // {
+            //     if let Err(error) = rustc_mir_transform::dump_mir::emit_mir(tcx) {
+            //         tcx.dcx().emit_fatal(CantEmitMIR { error });
+            //     }
+            // }
+
+            Some(rustc_interface::Linker::codegen_and_build_linker(
+                tcx,
+                &*compiler.codegen_backend,
+            ))
+        });
+
+        // Linking is done outside the `compiler.enter()` so that the
+        // `GlobalCtxt` within `Queries` can be freed as early as possible.
+        if let Some(linker) = linker {
+            linker.link(sess, codegen_backend);
+        }
+
+        println!("done.");
+    })
+}
+
+/* Cannot include these functions for diagnostics (or linking?) due to missing dependencies */
 // fn process_rlink(sess: &Session, compiler: &interface::Compiler) {
 //     assert!(sess.opts.unstable_opts.link_only);
 //     let dcx = sess.dcx();
@@ -621,195 +827,4 @@ fn make_output(
 
 pub fn diagnostics_registry() -> rustc_errors::registry::Registry {
     rustc_errors::registry::Registry::new(rustc_errors::codes::DIAGNOSTICS)
-}
-
-fn run_compiler(at_args: &[String]) {
-    let mut default_early_dcx =
-        rustc_session::EarlyDiagCtxt::new(rustc_session::config::ErrorOutputType::default());
-
-    let at_args = at_args.get(1..).unwrap_or_default();
-
-    let args = rustc_driver::args::arg_expand_all(&default_early_dcx, at_args);
-
-    let Some(matches) = rustc_driver::handle_options(&default_early_dcx, &args) else {
-        return;
-    };
-
-    let sopts = rustc_session::config::build_session_options(&mut default_early_dcx, &matches);
-    // let ice_file =
-
-    // if let Some(...)
-
-    let input = make_input(&default_early_dcx, &matches.free);
-    let has_input = input.is_some();
-    let (odir, ofile) = make_output(&matches);
-
-    drop(default_early_dcx);
-
-    let mut config = rustc_interface::Config {
-        opts: sopts,
-        crate_cfg: matches.opt_strs("cfg"),
-        crate_check_cfg: matches.opt_strs("check-cfg"),
-        input: input.unwrap_or(rustc_session::config::Input::File(std::path::PathBuf::new())),
-        output_file: ofile,
-        output_dir: odir,
-        file_loader: None,
-        locale_resources: rustc_driver::DEFAULT_LOCALE_RESOURCES.to_owned(),
-        lint_caps: Default::default(),
-        psess_created: None,
-        hash_untracked_state: None,
-        register_lints: None,
-        override_queries: None,
-        extra_symbols: Vec::new(),
-        make_codegen_backend: None,
-        ice_file: None,
-        registry: diagnostics_registry(),
-        using_internal_features: &rustc_driver::USING_INTERNAL_FEATURES,
-        expanded_args: args,
-    };
-
-    // callbacks.config(...)
-
-    let registered_lints = config.register_lints.is_some();
-
-    rustc_interface::run_compiler(config, |compiler| {
-        let sess = &compiler.sess;
-        let codegen_backend = &*compiler.codegen_backend;
-
-        // This is used for early exits unrelated to errors. E.g. when just
-        // printing some information without compiling, or exiting immediately
-        // after parsing, etc.
-        let early_exit = || {
-            sess.dcx().abort_if_errors();
-        };
-
-        // This implements `-Whelp`. It should be handled very early, like
-        // `--help`/`-Zhelp`/`-Chelp`. This is the earliest it can run, because
-        // it must happen after lints are registered, during session creation.
-        // if sess.opts.describe_lints {
-        //     describe_lints(sess, registered_lints);
-        //     return early_exit();
-        // }
-
-        // needed
-        if print_crate_info(codegen_backend, sess, has_input) == rustc_driver::Compilation::Stop {
-            return early_exit();
-        }
-
-        if !has_input {
-            #[allow(rustc::diagnostic_outside_of_impl)]
-            sess.dcx().fatal("no input filename given"); // this is fatal
-        }
-
-        if !sess.opts.unstable_opts.ls.is_empty() {
-            list_metadata(sess, &*codegen_backend.metadata_loader());
-            return early_exit();
-        }
-
-        // what is process_rlink? blocked because can't find something for #![derive(Diagnostics)] in session_diagnostics.rs
-        if sess.opts.unstable_opts.link_only {
-            // process_rlink(sess, compiler);
-            return early_exit();
-        }
-
-        // Parse the crate root source code (doesn't parse submodules yet)
-        // Everything else is parsed during macro expansion.
-        let mut krate = rustc_interface::passes::parse(sess);
-
-        // If pretty printing is requested: Figure out the representation, print it and exit
-        if let Some(pp_mode) = sess.opts.pretty {
-            if pp_mode.needs_ast_map() {
-                rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
-                    tcx.ensure_ok().early_lint_checks(());
-                    rustc_driver::pretty::print(
-                        sess,
-                        pp_mode,
-                        rustc_driver::pretty::PrintExtra::NeedsAstMap { tcx },
-                    );
-                    rustc_interface::passes::write_dep_info(tcx);
-                });
-            } else {
-                rustc_driver::pretty::print(
-                    sess,
-                    pp_mode,
-                    rustc_driver::pretty::PrintExtra::AfterParsing { krate: &krate },
-                );
-            }
-            // trace!("finished pretty-printing");
-            return early_exit();
-        }
-
-        // if callbacks.after_crate_root_parsing(compiler, &mut krate) == Compilation::Stop {
-        //     return early_exit();
-        // }
-
-        if sess.opts.unstable_opts.parse_crate_root_only {
-            return early_exit();
-        }
-
-        let linker = rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
-            let early_exit = || {
-                sess.dcx().abort_if_errors();
-                None
-            };
-
-            // Make sure name resolution and macro expansion is run.
-            let _ = tcx.resolver_for_lowering();
-
-            // if callbacks.after_expansion(compiler, tcx) == Compilation::Stop {
-            //     return early_exit();
-            // }
-
-            rustc_interface::passes::write_dep_info(tcx);
-
-            rustc_interface::passes::write_interface(tcx);
-
-            if sess
-                .opts
-                .output_types
-                .contains_key(&rustc_session::config::OutputType::DepInfo)
-                && sess.opts.output_types.len() == 1
-            {
-                return early_exit();
-            }
-
-            if sess.opts.unstable_opts.no_analysis {
-                return early_exit();
-            }
-
-            tcx.ensure_ok().analysis(());
-
-            // if let Some(metrics_dir) = &sess.opts.unstable_opts.metrics_dir {
-            //     dump_feature_usage_metrics(tcx, metrics_dir);
-            // }
-
-            // if callbacks.after_analysis(compiler, tcx) == Compilation::Stop {
-            //     return early_exit();
-            // }
-
-            // if tcx
-            //     .sess
-            //     .opts
-            //     .output_types
-            //     .contains_key(&rustc_session::config::OutputType::Mir)
-            // {
-            //     if let Err(error) = rustc_mir_transform::dump_mir::emit_mir(tcx) {
-            //         tcx.dcx().emit_fatal(CantEmitMIR { error });
-            //     }
-            // }
-
-            Some(rustc_interface::Linker::codegen_and_build_linker(
-                tcx,
-                &*compiler.codegen_backend,
-            ))
-        });
-
-        // Linking is done outside the `compiler.enter()` so that the
-        // `GlobalCtxt` within `Queries` can be freed as early as possible.
-        if let Some(linker) = linker {
-            linker.link(sess, codegen_backend);
-        }
-
-        println!("done.");
-    })
 }
